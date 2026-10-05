@@ -18,6 +18,16 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 检查点绝不代替两栏提交、回滚，也不替换连接；状态刷新只读取内存中
 最近一次检查点结果的缓存，不执行任何 SQL、不触发检查点。
 
+甲、乙两栏各有独立的只读开关，默认关闭。开启时就在本栏那条长期连接上
+真实执行 PRAGMA query_only=1，绝不换连接、不 COMMIT/ROLLBACK、不执行
+任何 SELECT（开关本身不提前建立读快照）。开启后读值、BEGIN DEFERRED、
+COMMIT、ROLLBACK 照旧可用；事务内的写语句由 SQLite 原样拒绝并返回
+SQLITE_READONLY(8)，语句终止但事务保持开启，此前未提交的修改不撤销。
+query_only 不释放写锁：本栏已持有写锁时开启只读，另一栏的写入仍得到
+SQLITE_BUSY(5)。COMMIT / ROLLBACK 不会重置开关；关闭后可在原事务继续
+写入，失败的只读写同样不建立读快照（他人提交后重试不会被误报为
+SQLITE_BUSY_SNAPSHOT）。开关状态在内存中按栏镜像，状态刷新只读这份镜像。
+
 删除实验（DELETE /api/experiments/<id>）先在内存门控上标记删除开始，
 并等待此前已进入的请求全部正常完成；删除开始后该实验的操作、状态、
 已提交值与检查点新请求一律返回 410。等待按实验独立，不阻塞其他实验。
@@ -118,6 +128,10 @@ class Experiment:
             "b": self._open_conn(self.overflow_flags["b"], autockpt=False),
         }
         self.conn_locks = {"a": threading.Lock(), "b": threading.Lock()}
+        # 两栏只读开关的内存镜像（PRAGMA query_only）：默认关闭，
+        # 与连接上真实设置保持一致。开关不随 COMMIT / ROLLBACK 重置，
+        # 状态刷新只读这份镜像，不执行任何 SQL。
+        self.readonly = {"a": False, "b": False}
         # 第三条连接：只读已提交值
         self.observer = self._open_conn()
         self.observer_lock = threading.Lock()
@@ -179,6 +193,7 @@ class Experiment:
         panel = self.panels[side]
         return {
             "in_transaction": self.conns[side].in_transaction,
+            "readonly": self.readonly[side],
             "last_read": json_int(panel.last_read),
             "log": list(panel.log),
         }
@@ -382,6 +397,43 @@ def run_op(exp, side, op, value):
                 "state": exp.panel_state(side),
             }
     return {"ok": True, "error": None, "state": exp.panel_state(side)}
+
+
+def run_set_readonly(exp, side, enabled):
+    """在本栏那条长期连接上真实切换 PRAGMA query_only。
+
+    不换连接、不 COMMIT/ROLLBACK、不执行任何 SELECT，因此开关本身不会
+    提前建立读快照，也不释放该连接已经持有的写锁。query_only=1 后写语句
+    由 SQLite 原样报 SQLITE_READONLY(8)，失败不结束事务、不撤销此前修改。
+    """
+    panel = exp.panels[side]
+    conn = exp.conns[side]
+    label = "开启只读" if enabled else "关闭只读"
+    with exp.conn_locks[side]:
+        try:
+            conn.execute("PRAGMA query_only=%d" % (1 if enabled else 0))
+        except sqlite3.Error as exc:
+            name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+            code = getattr(exc, "sqlite_errorcode", None)
+            panel.add_log("%s → 失败 [%s (%s)] %s" % (label, name, code, exc))
+            return {
+                "ok": False,
+                "error": {"name": name, "code": code, "message": str(exc)},
+                "state": exp.panel_state(side),
+            }
+        # 只有真实设置成功后才更新内存镜像
+        exp.readonly[side] = enabled
+        tail = (
+            "不结束当前事务、不释放写锁；提交 / 回滚不重置开关"
+            if conn.in_transaction
+            else "连接不替换；提交 / 回滚不重置开关"
+        )
+        panel.add_log(
+            "%s（PRAGMA query_only=%d）→ 成功，%s"
+            % (label, 1 if enabled else 0, tail)
+        )
+    return {"ok": True, "error": None, "state": exp.panel_state(side),
+            "readonly": enabled}
 
 
 def run_checkpoint(exp, mode):
@@ -595,6 +647,35 @@ def experiment_op(exp_id, side):
             if abs(value) > MAX_ADD_ABS:
                 return jsonify({"error": "value too large"}), 400
         return jsonify(run_op(exp, side, op, value))
+    finally:
+        exp.finish_call()
+
+
+@app.post("/api/experiments/<exp_id>/conn/<side>/readonly")
+@app.post("/api/experiments/<exp_id>/conn/<side>/readonly/<flag>")
+def experiment_readonly(exp_id, side, flag=None):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        if side not in ("a", "b"):
+            return jsonify({"error": "unknown side"}), 400
+        # 只接受真正的布尔值：JSON true/false，或路径里的 true/false 字面量；
+        # 0/1、"0"/"1"、yes/no、缺字段等一律拒绝（Python bool 是 int 子类，
+        # 必须显式按 bool 判定，不能用真值测试）。
+        if flag is None:
+            data = request.get_json(silent=True) or {}
+            enabled = data.get("readonly")
+            if not isinstance(enabled, bool):
+                return jsonify({"error": "readonly must be a boolean"}), 400
+        else:
+            if flag == "true":
+                enabled = True
+            elif flag == "false":
+                enabled = False
+            else:
+                return jsonify({"error": "readonly must be a boolean"}), 400
+        return jsonify(run_set_readonly(exp, side, enabled))
     finally:
         exp.finish_call()
 

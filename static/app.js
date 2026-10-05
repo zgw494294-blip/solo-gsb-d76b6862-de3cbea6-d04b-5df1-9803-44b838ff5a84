@@ -17,6 +17,12 @@ let committedTimer = null;
 // 保证同一时刻只会新建一个实验
 let creatingPromise = null;
 const lastRender = { a: "", b: "" };
+// 服务端每栏只读开关（PRAGMA query_only）的最近已知值，默认关闭。
+// 轮询渲染据此同步勾选框；切换请求失败时把勾选框回退到此值。
+const serverReadonly = { a: false, b: false };
+// 每栏是否有在途请求（操作或只读切换）：在途期间不让轮询回写勾选框，
+// 避免「用户已勾选、响应未回」时被旧状态弹回。
+const sideBusy = { a: false, b: false };
 
 const $ = (id) => document.getElementById(id);
 
@@ -163,8 +169,12 @@ async function createExperiment() {
   $("exp-id").textContent = expId;
   for (const side of ["a", "b"]) {
     lastRender[side] = "";
+    serverReadonly[side] = false;
+    sideBusy[side] = false;
     $(`tx-${side}`).textContent = "…";
     $(`dot-${side}`).classList.remove("on");
+    $(`ro-badge-${side}`).hidden = true;
+    $(`ro-toggle-${side}`).checked = false;
     $(`read-${side}`).textContent = "—";
     $(`log-${side}`).innerHTML = "";
     clearError(side);
@@ -269,6 +279,17 @@ function renderPanel(side, state) {
   const dot = $("dot-" + side);
   dot.classList.toggle("on", inTx);
   dot.title = inTx ? "事务已开启" : "事务未开启";
+
+  // 当前只读模式（PRAGMA query_only）：徽标 + 勾选框。
+  // 本栏有在途请求时不动勾选框：用户刚切换、响应尚未回来，
+  // 轮询里的旧状态不得把勾选框弹回去。
+  const readonly = state.readonly === true;
+  serverReadonly[side] = readonly;
+  $("ro-badge-" + side).hidden = !readonly;
+  if (!sideBusy[side]) {
+    $("ro-toggle-" + side).checked = readonly;
+  }
+
   $("read-" + side).textContent = state.last_read === null ? "—" : state.last_read;
 
   const logEl = $("log-" + side);
@@ -313,11 +334,61 @@ function renderCheckpoint(state) {
 }
 
 function setBusy(side, busy) {
-  // 只禁用本栏的按钮与输入框，另一栏不受影响
+  // 只禁用本栏的按钮与输入框，另一栏不受影响。
+  // sideBusy 同时用于阻止轮询在本栏请求在途期间回写只读勾选框。
+  sideBusy[side] = busy;
   for (const el of document.querySelectorAll(
     `#panel-${side} button, #panel-${side} input`
   )) {
     el.disabled = busy;
+  }
+}
+
+async function doToggleReadonly(side) {
+  // 每栏独立开关：在本栏长期连接上真实切换 PRAGMA query_only。
+  // 沿用本栏操作的禁用 / 冻结 / 新建隔离规则（setBusy + gen 校验）。
+  if (creating || expFrozen) return;
+  const enabled = $("ro-toggle-" + side).checked;
+  const gen = expGen;
+  setBusy(side, true);
+  clearError(side);
+  try {
+    const data = await fetchJson(
+      `/api/experiments/${expId}/conn/${side}/readonly`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ readonly: enabled }),
+      }
+    );
+    if (gen !== expGen) return;
+    renderPanel(side, data.state);
+    if (!data.ok && data.error) {
+      showError(side, data.error);
+    }
+  } catch (e) {
+    if (e instanceof ExpDeleted) {
+      if (gen === expGen) {
+        freezeExperiment(`实验 ${expId} 已删除（410）：只读开关未切换，旧实验操作已禁用，可点击「新建实验」继续。`);
+      }
+      return;
+    }
+    if (e instanceof ExpNotFound) {
+      if (gen === expGen && !expFrozen) {
+        await newExperiment();
+      }
+      return;
+    }
+    if (gen === expGen && !expFrozen) {
+      showError(side, { name: null, code: null, message: "请求失败：" + e.message });
+    }
+  } finally {
+    // 冻结 / 已切换到新实验后，迟到响应不得改动按钮状态；
+    // 恢复输入后以服务端确认的状态为准（失败时回退到最近已知值）。
+    if (gen === expGen && !expFrozen) {
+      setBusy(side, false);
+      $("ro-toggle-" + side).checked = serverReadonly[side];
+    }
   }
 }
 
@@ -393,6 +464,9 @@ function bindPanel(side) {
   for (const btn of document.querySelectorAll(`#panel-${side} button[data-op]`)) {
     btn.addEventListener("click", () => doOp(side, btn.dataset.op));
   }
+  $("ro-toggle-" + side).addEventListener("change", () => {
+    doToggleReadonly(side).catch(() => {});
+  });
 }
 
 function setCheckpointBusy(busy) {

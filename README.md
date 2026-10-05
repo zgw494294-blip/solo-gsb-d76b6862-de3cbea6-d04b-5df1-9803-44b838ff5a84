@@ -19,6 +19,16 @@
   observer 连接的已提交值预判，最终判定在 `UPDATE` 内的 `checked_add`
   函数中完成，因此不会把 `SQLITE_BUSY` 误报成 `SQLITE_BUSY_SNAPSHOT`
 - 修改操作（加上）只允许在事务内进行，禁止事务外修改
+- 每栏一个独立的**只读模式开关**（也可 HTTP 调用），默认关闭：在**本栏那条长期
+  连接**上真实执行 `PRAGMA query_only=1/0`，**不换连接、不结束事务、不提前读值
+  建立快照**。开启后读值、`BEGIN DEFERRED`、`COMMIT`、`ROLLBACK` 照常可用，「加上」
+  按钮保持可点；事务内未越界的加法由 SQLite 原样返回
+  **`SQLITE_READONLY`（错误码 8）**，语句终止但事务保持开启、此前未提交修改不撤销。
+  开关不释放写锁（本栏已持锁时开启，另一栏写入仍得到 `SQLITE_BUSY(5)`），失败的
+  只读写也不建立读快照（他人提交后关闭只读，在原事务重试不会被误报为
+  `SQLITE_BUSY_SNAPSHOT`）；`COMMIT` / `ROLLBACK` **不重置开关**，关闭后可在原事务
+  继续加法。开关按栏独立，状态与页面（勾选框 + 徽标）显示当前模式，状态刷新只读
+  内存镜像
 - 手动 **PASSIVE / TRUNCATE 检查点**按钮（也可 HTTP 调用）：每次用一条全新的
   独立连接真实执行 `PRAGMA wal_checkpoint`，`busy_timeout=0`，读事务阻止回收时
   立即返回 `busy=1`；各写连接已关闭自动检查点（`PRAGMA wal_autocheckpoint=0`）
@@ -110,6 +120,16 @@ node tests/races.test.js
 收尾响应不影响新实验、冻结页新建失败保持禁用且轮询停止（重试成功恢复）、
 存活页新建失败恢复旧实验、404 自动新建且并发只建一次、410 冻结不自动新建。
 
+```bash
+node tests/readonly.test.js
+```
+
+覆盖两栏只读开关：默认关闭与状态渲染（勾选框 + 徽标，两栏独立）、切换请求
+在途只禁用本栏全部控件（另一栏不受影响）且轮询不回写在途勾选框、切换失败
+回退勾选框并显示本栏错误、410 冻结且不自动新建、404 自动新建、旧切换的迟到
+成功响应不冻结 / 不覆盖新实验开关、新建成功复位两栏开关、请求体为真正的
+JSON 布尔值。
+
 ## 操作示例
 
 ### 示例一：快照隔离与快照冲突（SQLITE_BUSY_SNAPSHOT）
@@ -145,6 +165,88 @@ node tests/races.test.js
    乙的事务仍开启，系统**不会**自动回滚、不替换连接、也不改变事务类型
 4. 乙：`回滚` → `BEGIN DEFERRED` → 输入 `7` → `加上` → `提交`
    （已提交值变为 **112**）
+
+### 示例二之二：只读模式（PRAGMA query_only）与已有事务 / 写锁的关系
+
+> 每栏一个独立开关，默认关闭。开启 = 在**本栏那条长期连接**上真实执行
+> `PRAGMA query_only=1`：不换连接、不结束事务、不提前读值建立快照，也不释放
+> 已持有的写锁。开启后读值、`BEGIN`、`提交`、`回滚` 仍可用；事务内未越界加法
+> 由 SQLite 返回 **SQLITE_READONLY（错误码 8）**，不撤销此前未提交修改。
+> `提交` / `回滚` 不重置开关；关闭后可在原事务继续加法。
+
+1. 甲：`BEGIN DEFERRED` → 输入 `5` → `加上`（先不提交，甲持有写锁）
+2. 甲：勾选 **只读模式**（`PRAGMA query_only=1`，事务与写锁都保持不变）
+3. 甲：输入 `7` → `加上` → 立即报错 **SQLITE_READONLY（错误码 8）**；
+   甲的事务仍然开启，刚才的 `+5` **没有**被撤销
+4. 乙：`BEGIN DEFERRED`（不显式读值）→ 输入 `7` → `加上` →
+   立即报错 **SQLITE_BUSY（错误码 5）**（甲的写锁未因只读开关而释放）
+5. 甲：`提交`（只读不阻止提交；已提交值变为 **105**，甲栏开关仍为开启）
+6. 乙：**在原事务中**再次输入 `7` → `加上` → 成功（失败的只读写发生在甲连接上，
+   乙这边从未建立读快照，不会报 517）→ `提交`（已提交值变为 **112**）
+7. 甲：取消勾选 **只读模式**（`PRAGMA query_only=0`）→ 此后又可正常写入；
+   若第 5 步甲是 `回滚`，则已提交值回到 **100**，乙重试提交后为 **107**
+
+同一事务内「先写、再只读、失败、再关闭、继续写」也成立：
+
+1. 乙：`BEGIN DEFERRED` → 输入 `5` → `加上` → 勾选只读
+2. 乙：输入 `9` → `加上` → **SQLITE_READONLY（8）**（事务保持开启，`+5` 保留）
+3. 乙：取消勾选只读 → 输入 `3` → `加上` → 成功 → `提交`
+   （已提交值 = 100 + 5 + 3 = **108**，失败的 `+9` 从未写入）
+
+两栏完全独立：甲开启只读不影响乙读值、加法、提交、回滚；甲的开关提交 / 回滚后
+保持原样，新建实验才复位为关闭。
+
+#### HTTP 调用示例（只读开关）
+
+开关接口与检查点接口同形：既接受 JSON body（字段 `readonly` 必须是**真正的布尔
+值** `true` / `false`），也接受路径参数（仅小写 `true` / `false`）；数字 `0/1`、
+字符串 `"true"`、缺字段等一律 **400**，非法栏位同样 **400**，未知实验 **404**，
+删除中的实验 **410**：
+
+```bash
+EXP=<新建实验返回的 id>
+
+# 开启甲栏只读（JSON 布尔）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"readonly":true}'
+# {"ok":true,"readonly":true,
+#  "state":{"in_transaction":false,"readonly":true,"last_read":null,"log":[...]}}
+
+# 关闭甲栏只读（路径形式，仅 true/false）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/readonly/false
+
+# 非布尔值一律 400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  http://localhost:8000/api/experiments/$EXP/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"readonly":1}'
+# 400
+
+# 复现主交错场景
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":5}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"readonly":true}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":7}'
+# {"ok":false,"error":{"name":"SQLITE_READONLY","code":8,
+#  "message":"attempt to write a readonly database"}, ...}
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":7}'
+# {"ok":false,"error":{"name":"SQLITE_BUSY","code":5,...},...}
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'   # 已提交值 105
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":7}'   # 原事务重试成功
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'   # 已提交值 112
+# 甲栏状态里 readonly 仍为 true：提交不重置开关
+curl -s http://localhost:8000/api/experiments/$EXP/status
+# {"a":{"in_transaction":false,"readonly":true,...},"b":{...,"readonly":false},...}
+```
 
 ### 示例三：大整数精度（9007199254741093）
 

@@ -36,6 +36,7 @@ function makeElement(id, opts = {}) {
     id,
     hidden: false,
     disabled: false,
+    checked: false,
     textContent: "",
     value: opts.value !== undefined ? opts.value : "",
     title: "",
@@ -53,6 +54,9 @@ function makeElement(id, opts = {}) {
     },
     click() {
       for (const fn of listeners.click || []) fn.call(el);
+    },
+    dispatchChange() {
+      for (const fn of listeners.change || []) fn.call(el);
     },
   };
   Object.defineProperty(el, "innerHTML", {
@@ -86,6 +90,8 @@ function loadApp(search = "") {
   for (const side of ["a", "b"]) {
     get(`panel-${side}`);
     get(`add-input-${side}`, { value: "10" });
+    get(`ro-toggle-${side}`);
+    get(`ro-badge-${side}`);
     for (const op of ["begin", "read", "add", "commit", "rollback"]) {
       const btn = makeElement(`op-${side}-${op}`, { dataset: { op } });
       opButtons[side].push(btn);
@@ -123,10 +129,12 @@ function loadApp(search = "") {
     "#panel-a button, #panel-a input": [
       ...opButtons.a,
       elements.get("add-input-a"),
+      elements.get("ro-toggle-a"),
     ],
     "#panel-b button, #panel-b input": [
       ...opButtons.b,
       elements.get("add-input-b"),
+      elements.get("ro-toggle-b"),
     ],
     "#panel-a button[data-op]": opButtons.a,
     "#panel-b button[data-op]": opButtons.b,
@@ -257,15 +265,16 @@ function loadApp(search = "") {
 
 // 构造与后端接口同形的响应体
 function statusBody(expId, opts = {}) {
-  const side = (read, log, inTx) => ({
+  const side = (read, log, inTx, readonly) => ({
     in_transaction: !!inTx,
+    readonly: readonly === true,
     last_read: read === undefined ? null : read,
     log: log || [],
   });
   return {
     id: expId,
-    a: side(opts.aRead, opts.aLog, opts.aTx),
-    b: side(opts.bRead, opts.bLog, opts.bTx),
+    a: side(opts.aRead, opts.aLog, opts.aTx, opts.aReadonly),
+    b: side(opts.bRead, opts.bLog, opts.bTx, opts.bReadonly),
     checkpoint: { last: opts.ckptLast || null, log: opts.ckptLog || [] },
   };
 }

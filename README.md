@@ -19,6 +19,14 @@
   observer 连接的已提交值预判，最终判定在 `UPDATE` 内的 `checked_add`
   函数中完成，因此不会把 `SQLITE_BUSY` 误报成 `SQLITE_BUSY_SNAPSHOT`
 - 修改操作（加上）只允许在事务内进行，禁止事务外修改
+- 每栏一个**独立只读开关**（默认关闭，也可 HTTP 调用）：开启即在**该栏原长期
+  连接**上真实执行 `PRAGMA query_only=1`，不换连接、不结束当前事务，也不提前读值
+  建立读快照；关闭执行 `PRAGMA query_only=0`。开启后仍可读值、`BEGIN`、`提交`、
+  `回滚`（提交仍提交此前写入，回滚仍撤销），加法按钮保持可用，但事务内未越界的
+  加法由 SQLite 如实返回 **SQLITE_READONLY（错误码 8）**，语句失败不撤销此前
+  修改；关闭后可在**原事务**继续加法。`COMMIT` / `ROLLBACK` 不重置开关，两栏
+  开关互相独立，另一栏的写锁冲突仍报 `SQLITE_BUSY（5）`；状态接口与页面均显示
+  当前开关模式，开关请求只接受 JSON 布尔值（非布尔返回 `400`）
 - 手动 **PASSIVE / TRUNCATE 检查点**按钮（也可 HTTP 调用）：每次用一条全新的
   独立连接真实执行 `PRAGMA wal_checkpoint`，`busy_timeout=0`，读事务阻止回收时
   立即返回 `busy=1`；各写连接已关闭自动检查点（`PRAGMA wal_autocheckpoint=0`）
@@ -105,6 +113,14 @@ docker compose up --build
 node tests/races.test.js
 ```
 
+`tests/readonly.test.js` 用同一个假环境覆盖每栏只读开关：状态同步到文案 /
+复选框、请求期间只禁用本栏（另一栏照常）、两栏独立、布尔请求体、网络失败回退、
+410 冻结、404 自动新建后开关重置、旧开关迟到响应不影响新实验、冻结页点击不发请求：
+
+```bash
+node tests/readonly.test.js
+```
+
 覆盖：创建期间旧轮询被暂停（含已入队迟到回调）、创建进行中触发的旧轮询
 迟到 200 / 410 均不改新页面也不冻结、旧操作 / 检查点 / 删除的成功 / 失败 /
 收尾响应不影响新实验、冻结页新建失败保持禁用且轮询停止（重试成功恢复）、
@@ -145,6 +161,93 @@ node tests/races.test.js
    乙的事务仍开启，系统**不会**自动回滚、不替换连接、也不改变事务类型
 4. 乙：`回滚` → `BEGIN DEFERRED` → 输入 `7` → `加上` → `提交`
    （已提交值变为 **112**）
+
+### 示例二补二：两栏只读开关（PRAGMA query_only）与已有事务、写锁的关系
+
+> 开关在**该栏原长期连接**上真实执行 `PRAGMA query_only=1/0`：不换连接、不结束
+> 事务、不先读值（不建立读快照）。开启后读值 / BEGIN / 提交 / 回滚照常，
+> 加法按钮也照常可点；未越界的加法由 SQLite 返回 **SQLITE_READONLY（8）**，
+> 但不撤销此前修改。提交 / 回滚不重置开关；两栏开关互相独立。
+
+1. 甲：`BEGIN DEFERRED` → 输入 `5` → `加上`（先不提交，甲持有写锁）
+2. 甲：勾选本栏 **只读开关** → 日志显示
+   `只读模式：开启 → 成功（原连接、当前事务不变；提交 / 回滚不重置本开关）`，
+   状态栏「只读」变为 **开启**
+3. 甲：输入 `7` → `加上` → 立即报错 **SQLITE_READONLY（错误码 8）**：
+   attempt to write to a readonly database。甲的事务仍然开启，第 1 步的 +5
+   **不被撤销**；甲点 `读值` 仍能读（此时读到本事务内的 **105**）
+4. 乙：`BEGIN DEFERRED`（不显式读值）→ 输入 `7` → `加上` →
+   立即报错 **SQLITE_BUSY（错误码 5）**（甲仍持有写锁；只读是甲自己连接的事，
+   与写锁互不干扰），乙的事务不会被自动结束
+5. 甲：`提交`（只读下允许提交：+5 落地，已提交值变为 **105**）；
+   提交后甲的只读开关**仍为开启**
+6. 乙：**在原事务中**再次输入 `7` → `加上` → 成功 → `提交`
+   （已提交值变为 **112**）
+7. 甲：取消勾选只读开关（`PRAGMA query_only=0`）→ `BEGIN DEFERRED` →
+   输入 `3` → `加上` → 成功（关闭后在原 / 新事务都能继续写）
+
+补充：在只读开启时 `回滚` 同样允许——例如甲事务内先 +9 再开启只读，
+`回滚` 会撤销 +9（已提交值不变），且回滚后开关**仍为开启**；开关只由本栏的
+开关动作改变。若加法的累加结果本身就超出 64 位整数范围，仍优先被既有的
+溢出检查拒绝（「累加结果超出有符号 64 位整数范围，本次未修改」）。
+
+#### HTTP 调用示例
+
+开关接口为每栏独立的 POST，body 必须且只能是 JSON 布尔；模式同时出现在
+`/status` 的 `a.readonly` / `b.readonly` 中：
+
+```bash
+EXP=<新建实验返回的 id>
+
+# 甲：事务内 +5 后开启只读
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":5}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"enabled":true}'
+# {"ok":true,"error":null,
+#  "state":{"in_transaction":true,"readonly":true,"last_read":null,"log":[...]}}
+
+# 只读下再加 7：SQLite 原样返回 SQLITE_READONLY(8)，事务保持开启，+5 保留
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":7}'
+# {"ok":false,
+#  "error":{"name":"SQLITE_READONLY","code":8,
+#           "message":"attempt to write to a readonly database"},
+#  "state":{"in_transaction":true,"readonly":true,...}}
+
+# 读值 / 提交在只读下照常；提交后 readonly 仍为 true（提交不重置开关）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"read"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'
+
+# 关闭只读：原连接执行 PRAGMA query_only=0，之后可继续加法
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"enabled":false}'
+
+# 非布尔值一律 400（1/0、"true"/"false"、null、缺字段、非 JSON body 同理）
+for v in '1' '0' '"true"' 'null'; do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+    http://localhost:8000/api/experiments/$EXP/conn/a/readonly \
+    -H 'Content-Type: application/json' -d "{\"enabled\":$v}"
+done
+# 400
+# 400
+# 400
+# 400
+
+# 当前模式随状态接口返回（不执行任何 SQL）
+curl -s http://localhost:8000/api/experiments/$EXP/status
+# {"id":"...","a":{"in_transaction":false,"readonly":false,...},
+#  "b":{"in_transaction":false,"readonly":false,...},"checkpoint":{...}}
+```
+
+> 开关请求与本栏其它操作共用同一规则：请求未完成时禁用本栏控件（另一栏不受
+> 影响）；「新建实验」进行中禁用；实验删除后冻结、接口返回 **410**；
+> 旧实验的迟到开关响应不会影响新实验页面。
+
 
 ### 示例三：大整数精度（9007199254741093）
 

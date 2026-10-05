@@ -99,6 +99,26 @@ main {
   color: #2563eb;
 }
 
+.ro-state.on {
+  color: #b91c1c;
+}
+
+.ro-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: #374151;
+  cursor: pointer;
+  user-select: none;
+  margin-left: 4px;
+}
+
+.ro-toggle input {
+  width: auto;
+  cursor: pointer;
+}
+
 .controls {
   display: flex;
   gap: 8px;

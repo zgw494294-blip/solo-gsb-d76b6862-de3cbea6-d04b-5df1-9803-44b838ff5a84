@@ -38,6 +38,7 @@ function makeElement(id, opts = {}) {
     disabled: false,
     textContent: "",
     value: opts.value !== undefined ? opts.value : "",
+    checked: opts.checked !== undefined ? opts.checked : false,
     title: "",
     scrollTop: 0,
     dataset: opts.dataset || {},
@@ -53,6 +54,13 @@ function makeElement(id, opts = {}) {
     },
     click() {
       for (const fn of listeners.click || []) fn.call(el);
+    },
+    // 复选框用：模拟用户勾选 / 取消并触发 change。
+    // disabled 的复选框上用户操作不会触发 change（页面冻结时本就如此）。
+    change(checked) {
+      if (el.disabled) return;
+      el.checked = checked;
+      for (const fn of listeners.change || []) fn.call(el, { target: el });
     },
   };
   Object.defineProperty(el, "innerHTML", {
@@ -83,9 +91,12 @@ function loadApp(search = "") {
 
   // 甲、乙两栏按钮（与 index.html 中五个 data-op 一致）
   const opButtons = { a: [], b: [] };
+  const roToggles = {};
   for (const side of ["a", "b"]) {
     get(`panel-${side}`);
     get(`add-input-${side}`, { value: "10" });
+    get(`ro-${side}`);
+    roToggles[side] = get(`ro-toggle-${side}`);
     for (const op of ["begin", "read", "add", "commit", "rollback"]) {
       const btn = makeElement(`op-${side}-${op}`, { dataset: { op } });
       opButtons[side].push(btn);
@@ -123,10 +134,12 @@ function loadApp(search = "") {
     "#panel-a button, #panel-a input": [
       ...opButtons.a,
       elements.get("add-input-a"),
+      roToggles.a,
     ],
     "#panel-b button, #panel-b input": [
       ...opButtons.b,
       elements.get("add-input-b"),
+      roToggles.b,
     ],
     "#panel-a button[data-op]": opButtons.a,
     "#panel-b button[data-op]": opButtons.b,
@@ -257,15 +270,16 @@ function loadApp(search = "") {
 
 // 构造与后端接口同形的响应体
 function statusBody(expId, opts = {}) {
-  const side = (read, log, inTx) => ({
+  const side = (read, log, inTx, readonly) => ({
     in_transaction: !!inTx,
+    readonly: !!readonly,
     last_read: read === undefined ? null : read,
     log: log || [],
   });
   return {
     id: expId,
-    a: side(opts.aRead, opts.aLog, opts.aTx),
-    b: side(opts.bRead, opts.bLog, opts.bTx),
+    a: side(opts.aRead, opts.aLog, opts.aTx, opts.aRo),
+    b: side(opts.bRead, opts.bLog, opts.bTx, opts.bRo),
     checkpoint: { last: opts.ckptLast || null, log: opts.ckptLog || [] },
   };
 }

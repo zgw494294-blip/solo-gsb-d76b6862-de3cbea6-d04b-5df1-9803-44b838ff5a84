@@ -27,6 +27,7 @@
       <div class="status-line">
         <span class="dot" id="dot-a"></span>
         <span>事务：<b id="tx-a">…</b></span>
+        <span>只读（PRAGMA query_only）：<b id="ro-a" class="ro-state">…</b></span>
         <span>最近一次显式读值：<b id="read-a" class="read-value">—</b></span>
       </div>
       <div class="controls">
@@ -38,6 +39,9 @@
         </span>
         <button type="button" data-op="commit">提交</button>
         <button type="button" data-op="rollback">回滚</button>
+        <label class="ro-toggle" title="在本栏原长期连接上真实执行 PRAGMA query_only：不换连接、不结束事务；开启后写语句由 SQLite 返回 SQLITE_READONLY(8)，提交/回滚不重置">
+          <input type="checkbox" id="ro-toggle-a"> 只读开关
+        </label>
       </div>
       <div class="error-box" id="error-a" hidden></div>
       <ol class="log" id="log-a"></ol>
@@ -48,6 +52,7 @@
       <div class="status-line">
         <span class="dot" id="dot-b"></span>
         <span>事务：<b id="tx-b">…</b></span>
+        <span>只读（PRAGMA query_only）：<b id="ro-b" class="ro-state">…</b></span>
         <span>最近一次显式读值：<b id="read-b" class="read-value">—</b></span>
       </div>
       <div class="controls">
@@ -59,6 +64,9 @@
         </span>
         <button type="button" data-op="commit">提交</button>
         <button type="button" data-op="rollback">回滚</button>
+        <label class="ro-toggle" title="在本栏原长期连接上真实执行 PRAGMA query_only：不换连接、不结束事务；开启后写语句由 SQLite 返回 SQLITE_READONLY(8)，提交/回滚不重置">
+          <input type="checkbox" id="ro-toggle-b"> 只读开关
+        </label>
       </div>
       <div class="error-box" id="error-b" hidden></div>
       <ol class="log" id="log-b"></ol>
@@ -84,7 +92,10 @@
   <footer>
     <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照，也不触发检查点
        （检查点结果只读内存缓存）；写锁冲突会立即返回
-       SQLite 错误名与错误码，不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。</p>
+       SQLite 错误名与错误码，不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。
+       每栏只读开关在<b>本栏原连接</b>上真实执行 <code>PRAGMA query_only</code>，
+       不换连接、不结束事务、不建立快照；开启后加法由 SQLite 返回 SQLITE_READONLY(8)，
+       读值 / 提交 / 回滚照常，提交 / 回滚不重置开关。</p>
   </footer>
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>

@@ -166,6 +166,9 @@ async function createExperiment() {
     $(`tx-${side}`).textContent = "…";
     $(`dot-${side}`).classList.remove("on");
     $(`read-${side}`).textContent = "—";
+    $(`ro-${side}`).textContent = "…";
+    $(`ro-${side}`).classList.remove("on");
+    $(`ro-toggle-${side}`).checked = false;
     $(`log-${side}`).innerHTML = "";
     clearError(side);
   }
@@ -270,6 +273,15 @@ function renderPanel(side, state) {
   dot.classList.toggle("on", inTx);
   dot.title = inTx ? "事务已开启" : "事务未开启";
   $("read-" + side).textContent = state.last_read === null ? "—" : state.last_read;
+
+  // 只读开关状态来自服务端内存：状态轮询同步文案与复选框。
+  // 程序化设置 checked 不会触发 change 事件，不会形成请求回环。
+  const ro = !!state.readonly;
+  const roEl = $("ro-" + side);
+  roEl.textContent = ro ? "开启" : "关闭";
+  roEl.classList.toggle("on", ro);
+  const roToggle = $("ro-toggle-" + side);
+  if (roToggle.checked !== ro) roToggle.checked = ro;
 
   const logEl = $("log-" + side);
   logEl.innerHTML = "";
@@ -392,6 +404,58 @@ async function doOp(side, op) {
 function bindPanel(side) {
   for (const btn of document.querySelectorAll(`#panel-${side} button[data-op]`)) {
     btn.addEventListener("click", () => doOp(side, btn.dataset.op));
+  }
+  // 只读开关：每栏独立，遵守与该栏操作相同的「请求期间禁用本栏」规则。
+  // 点击时复选框已是新状态；失败 / 410 / 冻结 / 迟到都按服务端状态回退。
+  $("ro-toggle-" + side).addEventListener("change", (ev) => {
+    doSetReadonly(side, ev.target.checked).catch(() => {});
+  });
+}
+
+async function doSetReadonly(side, enabled) {
+  if (creating || expFrozen) return;
+  const gen = expGen;
+  const toggle = $("ro-toggle-" + side);
+  // 与操作按钮相同：请求未完成时禁用本栏全部控件（含复选框），另一栏不受影响
+  setBusy(side, true);
+  clearError(side);
+  try {
+    const data = await fetchJson(
+      `/api/experiments/${expId}/conn/${side}/readonly`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      }
+    );
+    if (gen !== expGen) return;
+    renderPanel(side, data.state);
+    if (!data.ok && data.error) {
+      showError(side, data.error);
+    }
+  } catch (e) {
+    if (e instanceof ExpDeleted) {
+      if (gen === expGen) {
+        freezeExperiment(`实验 ${expId} 已删除（410）：只读开关未变更，旧实验操作已禁用，可点击「新建实验」继续。`);
+      }
+      return;
+    }
+    if (e instanceof ExpNotFound) {
+      if (gen === expGen && !expFrozen) {
+        await newExperiment();
+      }
+      return;
+    }
+    if (gen === expGen && !expFrozen) {
+      // 瞬时失败：复选框回退到点击前状态，错误显示在本栏
+      toggle.checked = !enabled;
+      showError(side, { name: null, code: null, message: "请求失败：" + e.message });
+    }
+  } finally {
+    // 冻结 / 已切换到新实验后，迟到响应不得改动当前控件状态
+    if (gen === expGen && !expFrozen) {
+      setBusy(side, false);
+    }
   }
 }
 

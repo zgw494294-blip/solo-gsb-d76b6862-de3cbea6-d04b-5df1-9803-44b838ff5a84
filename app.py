@@ -11,6 +11,15 @@ checked_add 函数做最终精确判定，绝不先在本连接上 SELECT ——
 首次写锁冲突（SQLITE_BUSY）后本事务会留下读快照，对方提交释放写锁后
 重试即被误报为 SQLITE_BUSY_SNAPSHOT。
 
+每栏另有一个独立的只读开关（默认关闭）：开启即在**该栏原长期连接**上
+真实执行 PRAGMA query_only=1，不换连接、不结束当前事务，也不先读任何值
+（不建立读快照）；关闭执行 PRAGMA query_only=0。开启后读值、BEGIN、
+COMMIT、ROLLBACK 都照常（COMMIT 仍会提交此前写入，ROLLBACK 仍撤销），
+加法按钮也保持可用，但事务内未越界的加法会被 SQLite 如实拒绝为
+SQLITE_READONLY(8)，语句失败不撤销此前修改；关闭后可在原事务继续加法。
+提交 / 回滚不重置开关，开关状态只保存在内存并随状态接口返回。两栏开关
+互相独立，乙的写锁冲突仍如实报 SQLITE_BUSY(5)。
+
 WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而是每次
 用一条全新的独立连接真实执行 PRAGMA wal_checkpoint，busy_timeout=0：
 读事务阻止回收时立即返回 busy=1，不等待。各写连接均已关闭自动检查点
@@ -93,6 +102,10 @@ class PanelState:
         # 当前事务是否已建立读快照：显式读值后为 True，
         # 成功写入后也为 True；BEGIN 与 COMMIT/ROLLBACK 后重置。
         self.tx_has_snapshot = False
+        # 本栏只读开关（PRAGMA query_only）：默认关闭，只保存在内存。
+        # 开关在原长期连接上生效，不换连接、不结束事务；
+        # COMMIT / ROLLBACK 不重置它，两栏各自独立。
+        self.readonly = False
 
     def add_log(self, text):
         self.log.append("%s  %s" % (time.strftime("%H:%M:%S"), text))
@@ -179,6 +192,7 @@ class Experiment:
         panel = self.panels[side]
         return {
             "in_transaction": self.conns[side].in_transaction,
+            "readonly": panel.readonly,
             "last_read": json_int(panel.last_read),
             "log": list(panel.log),
         }
@@ -381,6 +395,36 @@ def run_op(exp, side, op, value):
                 "error": {"name": name, "code": code, "message": str(exc)},
                 "state": exp.panel_state(side),
             }
+    return {"ok": True, "error": None, "state": exp.panel_state(side)}
+
+
+def run_set_readonly(exp, side, enabled):
+    """在该栏**原长期连接**上真实切换 PRAGMA query_only。
+
+    不更换连接、不 COMMIT / ROLLBACK 当前事务，也不执行任何读取
+    （不会为 DEFERRED 事务建立读快照）；开关状态只保存在 PanelState。
+    开启后 SQLite 对写语句返回 SQLITE_READONLY(8)，此前写入与未提交
+    事务都原样保留；COMMIT / ROLLBACK 不重置开关。
+    """
+    panel = exp.panels[side]
+    conn = exp.conns[side]
+    label = "只读模式：开启" if enabled else "只读模式：关闭"
+    with exp.conn_locks[side]:
+        try:
+            conn.execute("PRAGMA query_only=%d" % (1 if enabled else 0))
+        except sqlite3.Error as exc:
+            name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+            code = getattr(exc, "sqlite_errorcode", None)
+            panel.add_log("%s → 失败 [%s (%s)] %s" % (label, name, code, exc))
+            return {
+                "ok": False,
+                "error": {"name": name, "code": code, "message": str(exc)},
+                "state": exp.panel_state(side),
+            }
+        panel.readonly = enabled
+        panel.add_log(
+            "%s → 成功（原连接、当前事务不变；提交 / 回滚不重置本开关）" % label
+        )
     return {"ok": True, "error": None, "state": exp.panel_state(side)}
 
 
@@ -595,6 +639,24 @@ def experiment_op(exp_id, side):
             if abs(value) > MAX_ADD_ABS:
                 return jsonify({"error": "value too large"}), 400
         return jsonify(run_op(exp, side, op, value))
+    finally:
+        exp.finish_call()
+
+
+@app.post("/api/experiments/<exp_id>/conn/<side>/readonly")
+def experiment_set_readonly(exp_id, side):
+    exp, response = admit_experiment(exp_id)
+    if exp is None:
+        return response
+    try:
+        if side not in ("a", "b"):
+            return jsonify({"error": "unknown side"}), 400
+        data = request.get_json(silent=True)
+        # 严格只接受 JSON 布尔：1/0、"true"、None 等一律拒绝，
+        # get_json 解析失败（body 不是 JSON）时 data 为 None 同样拒绝。
+        if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+            return jsonify({"error": "enabled must be a boolean"}), 400
+        return jsonify(run_set_readonly(exp, side, data["enabled"]))
     finally:
         exp.finish_call()
 
